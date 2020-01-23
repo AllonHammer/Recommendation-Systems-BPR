@@ -4,12 +4,16 @@ import numpy as np
 from tqdm import trange
 from scipy.sparse import csr_matrix
 from hyperopt import hp, fmin, tpe,  Trials
-from Utils.utils import item_popularity, sample_batch_uij, auc_score
+from Utils.utils import item_popularity, sample_batch_uij,  acc_score
 
 class DataSet():
-    """ A class used to represent a dataset"""
-    def __init__(self,  seed=12, validation_percent=0.3):
-        #
+    """ A class used to represent a dataset
+    :arg seed: int random seed for reproduction
+    :arg validation_percent: float. decides the percent of items per each user to be  in validation set.
+                                    If None than take only one item for each user to be in the validation set.
+
+    """
+    def __init__(self,  seed=12, validation_percent=None):
         parent_path= dirname(dirname(abspath(__file__)))
 
         self.data = pd.read_csv(join(parent_path,'Resources/Train.csv'))
@@ -22,10 +26,16 @@ class DataSet():
         self.item_popularity_validation=item_popularity(self.validation)
         self.users = self.train.shape[0]
         self.items = self.train.shape[1]
+        self.unranked_items_per_user = self.get_unranked()
 
 
 
     def train_validation(self):
+        """Creates train and validation sets as CSR matrices
+        The way it is done is iterating across users and randomly picking one (or more)
+        items to be used in validation
+        """
+
         seed=np.random.RandomState(self.seed)
         #create SCR matrix for efficiency
         rows = self.data.UserID.astype('category').cat.codes
@@ -41,9 +51,12 @@ class DataSet():
             # indexes of csr.indeces where the data of the relevant user is
             # https://stackoverflow.com/questions/52299420/scipy-csr-matrix-understand-indptr #
             items = csr.indices[csr.indptr[user]: csr.indptr[user+1]]
-            #for each user randomaly select items for validation set
-            cutoff = int(self.validation_percent*len(items))
-            items_chosen = seed.choice(items, size=cutoff, replace=False)
+            if self.validation_percent is None: #we will take only one item per user
+                items_chosen = seed.choice(items, size=1)
+            else:
+                #for each user randomaly select items for validation set
+                cutoff = int(self.validation_percent*len(items))
+                items_chosen = seed.choice(items, size=cutoff, replace=False)
             train[user,items_chosen] = 0
             validation[user,items_chosen] = 1
 
@@ -51,7 +64,20 @@ class DataSet():
 
 
 
+    def get_unranked(self):
+        """ creates a dict where the keys are user ids
+            and items are lists of item ids that were not ranked by the user
+            this will be used in MPR evaluation"""
 
+        items = range(self.items)
+        indices = list(set(np.concatenate([self.train.indices, self.validation.indices])))
+        indptrs = list(set(np.concatenate([self.train.indptr + self.validation.indptr])))
+        unranked_items= {}
+        for user in range(self.users):
+            positive_items = indices[indptrs[user]: indptrs[user + 1]]
+            negative_items = list(set(items) - set(positive_items))
+            unranked_items[user] = negative_items
+        return unranked_items
 
 
 class Model():
@@ -62,7 +88,10 @@ class Model():
     :arg n_items: mapping  the number of items in the training set
     :arg l_users: float regularization term for users
     :arg l_items: float regularization term for items
+    :arg l_bias_items: float regularization term for item biases
     :arg learning_rate: float
+    :arg use_decay: bool
+    :arg learning_decay: float used only when use_decay=True
     :arg seed: int random seed for reproduction
     """
 
@@ -84,8 +113,8 @@ class Model():
 
         rstate = np.random.RandomState(self.seed)
         k=int(self.k)
-        self.u = rstate.normal(0, 1 / np.sqrt(k), (self.m, k))  #switch variance to 0.1?
-        self.v = rstate.normal(0, 1 / np.sqrt(k), (self.n, k))  #switch variance to 0.1?
+        self.u = rstate.normal(0, 1 / np.sqrt(k), (self.m, k))
+        self.v = rstate.normal(0, 1 / np.sqrt(k), (self.n, k))
         self.b = rstate.normal(0,1, size=self.n)
 
 
@@ -97,7 +126,7 @@ class Model():
         :param epochs: int, one epoch is a full update across all users
         :param batch_size: int
         :param sample_method: string 'random'/'populairty
-        :return best auc: float (0..1) the higher the better
+        :return best acc: float (0..1) the higher the better
         """
 
         self.init_variables()
@@ -125,10 +154,10 @@ class Model():
 
         # when called from self.hyperparmas_tune()
         preds = self.predict_all(use_bias=True)
-        auc=auc_score(preds, validation)
+        acc=acc_score(preds, validation, sample_method)
 
 
-        return np.round(auc,3)
+        return np.round(acc,3)
 
 
 
@@ -169,7 +198,7 @@ class Model():
         # to do      x_uij = xui-xuj
         # so         x_uij = np.sum(u*(i-j), axis=1)
 
-        x_uij = np.sum(u*(i-j), axis=1) # (batch_size,)
+        x_uij = np.sum(u*(i-j), axis=1) + bi - bj  # (batch_size,)
 
         # compute 1-sigmoid(x_uij)
         err = np.exp(-x_uij)/(1+np.exp(-x_uij)) # (batch_size,)
@@ -197,23 +226,30 @@ class Model():
 
 
     def predict(self,u, i, j, use_bias=False):
-        """ predict that for user u, the probability it will prefer item i over j
+        """ predict that for user u: 1 if user will prefer item i over j and 0 otherwise
         :param u: int. user_id
         :param i: int. positive item_id
         :param j: int. negative item_id
+        :param use_bias: bool
+
         """
         if i>self.v.shape[0] or j>self.v.shape[0]: # unknown item
             print('Unknown items {}, {}'.format(i,j))
-            return 0.5
+            return 0
         if use_bias:
             x = np.dot(self.u[u, :], self.v[i, :].T) + self.b[i] - np.dot(self.u[u, :], self.v[j, :].T) - self.b[j]
         else:
             x = np.dot(self.u[u, :], self.v[i, :].T) - np.dot(self.u[u, :], self.v[j, :].T)
 
-        return 1/(1+np.exp(-x))
+        pred = 1/(1+np.exp(-x))
+
+        return 1 if pred>=0.5 else 0
 
     def predict_all(self, use_bias=False):
-        """ predict all items for all users"""
+        """ predict all items for all users
+        :param use_bias: bool
+        :return np.array(m- number of users, n- number of items) full prediction matrix
+        """
         if use_bias:
             b = self.b
         else:
@@ -268,13 +304,13 @@ class Model():
 
         params=payload['params']
         external=payload['external']
-        for key in params.keys():
+        for key in params.keys(): #change hyperparameters according to their value
             exec("self.{}={}".format(key, params[key]))
         print(' Set Hyperparams to k:{} lu: {} lv:{} lvb:{} alpha:{} decay: {} use_decay: {}'.format(self.k,self.lu,self.lv, self.lvb, self.alpha, self.decay, self.use_decay))
-        auc = self.fit(**external)
-        auc *= -1 #minimizing the negative
-        print('AUC  Validation set: {}'.format(-1*auc))
-        return auc
+        acc = self.fit(**external) #fit the model again to get new acc score
+        acc *= -1 #minimizing the negative
+        print('ACC  Validation set: {}'.format(-1*acc))
+        return acc
 
 
 

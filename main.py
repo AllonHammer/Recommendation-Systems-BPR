@@ -1,53 +1,80 @@
 from Utils.classes import DataSet, Model
-from Utils.utils import auc_score, precision_at_k, mpr
+from Utils.utils import auc_score, acc_score, precision_at_k, mpr,  hit_rate_at_k
 import time
+from Resources import config
 
-tune=False
-data_configs = {'seed': 7 , 'validation_percent': 0.2}
 
 
 
 wall_start = time.time()
-d = DataSet(**data_configs)
-data_prep_time=time.time()
-print('Time to prep data', data_prep_time- wall_start)
+sample_method = config.method
+d = DataSet(**config.data_configs)
 
 
-bpr_params = {'latent_dim': 38, 'n_users': d.users, 'n_items': d.items, 'l_users':0.02106964961227692,
-              'l_items':0.016332371340206816, 'l_bias_items':0.05722601017641107, 'learning_rate': 0.13460602180353268,
-              'use_decay': False , 'learning_decay':0, 'seed': data_configs['seed']}
+if sample_method =='random':
+    bpr_params = config.bpr_params_random
+else:
+    bpr_params = config.bpr_params_pop
+
+bpr_params['n_users'] = d.users
+bpr_params['n_items'] = d.items
 
 
 bpr = Model(**bpr_params)
 
-if tune:
-    tuning_results = bpr.hyperparmas_tune(train=d.train, validation=d.validation, epochs=300, max_evals=100) #this could take long
+if config.tune:
+    tuning_results = bpr.hyperparmas_tune(train=d.train, validation=d.validation, epochs=200, max_evals=100, sample_method=sample_method) #this could take long
     for k in tuning_results.keys(): #update with optimized values
         bpr_params[k] = tuning_results[k]
 
+    print('Best dict for popularity', bpr_params)
 
-bpr.fit(train=d.train,  epochs=250, batch_size=100,  sample_method='random')
-model_train_time=time.time()
-print('Time to train model in seconds: ', round(model_train_time-data_prep_time,1))
-preds=bpr.predict_all()
-predictions_time=time.time()
-print('Time to generate all predictions in seconds: ', round(predictions_time-model_train_time,1))
 
-print('AUC score Train set: ', auc_score(preds, d.train))
-print('AUC score Validation set: ',auc_score(preds, d.validation))
-auc_time = time.time()
-print('Time to evaluate auc in seconds: ', round(auc_time-predictions_time,1))
+if config.EVALUATE:
+    bpr.fit(train=d.train,  epochs=config.epochs, batch_size=config.batch_size,  sample_method=sample_method)
 
-print('Precision at K Train Set: ', precision_at_k(preds, d.train))
-print('Precision at K Validation Set: ',precision_at_k(preds, d.validation))
-precision_time = time.time()
-print('Time to evaluate precision at k in seconds: ', round(precision_time-auc_time,1))
 
-print('MPR Validation Set: ', mpr(preds, d.validation))
-mpr_time = time.time()
-print('Time to evaluate mpr in seconds: ', round(mpr_time-precision_time,1))
+    preds=bpr.predict_all(use_bias=True)
+
+
+    print('ACC score Validation set: ',acc_score(preds, d.validation, sample_method))
+    print('AUC score Validation set: ',auc_score(preds, d.validation))
+    if config.data_configs['validation_percent'] is not None: #more than one item per user in validation
+        print('Precision at K Validation Set: ',precision_at_k(preds, d.validation))
+    else:
+        print('Hit rate at K Validation Set: ',hit_rate_at_k(preds, d.validation))
+    print('MPR Validation Set: ', mpr(preds, d.validation, d.unranked_items_per_user))
+
+
+if config.SAVE_RESULTS:
+    # train on all of the data (no split to validation)
+    d = DataSet(validation_percent=0)
+    bpr.fit(train=d.train, epochs=config.epochs, batch_size=config.batch_size, sample_method=sample_method)
+
+    if sample_method=='random':
+        test_set=d.random_test.copy()
+        final_result=d.random_test.copy()
+    else:
+        test_set=d.popularity_test.copy()
+        final_result=d.popularity_test.copy()
+
+    #encode the users and items like we did in the CSR
+    test_set['UserID']=test_set['UserID'].astype('category').cat.codes
+    test_set['Item1']=test_set['Item1'].astype('category').cat.codes
+    test_set['Item2']=test_set['Item2'].astype('category').cat.codes
+    test_set['bitClassification']=test_set.apply(lambda x: bpr.predict(x[0], x[1], x[2], use_bias=True), axis=1)
+    # in the assignment it says that 0 if you predict that the first item was the item that was liked by the user and vice versa
+    test_set['bitClassification']=1-test_set['bitClassification']
+    # since we encoded the users and the items lets copy our prediction to the final test set
+    final_result['bitClassification']= test_set['bitClassification']
+    #save to local fs
+    final_result.to_csv('Resources/{}_201641164_037098985_205766496.csv'.format(sample_method), index=False)
+
 wall_end = time.time()
 print('Wall time in seconds: ', round(wall_end - wall_start,1))
+
+
+
 
 
 
